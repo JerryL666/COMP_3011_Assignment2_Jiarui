@@ -8,7 +8,13 @@
  *
  * Modifications:
  *   Extended the command-line help text with frame processor options.
- *
+ *   Added parsing and storage for black-and-white effect options
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
@@ -28,6 +34,8 @@ import java.util.List;
  */
 public class CommandLineController {
     private final String[] args;
+ // Keep effects in command-line order and allow repeated effects.
+    private final List<FrameProcessor> frameProcessors = new ArrayList<>();
 
     private boolean helpRequested;
     private boolean audioRequested;
@@ -49,6 +57,10 @@ public class CommandLineController {
 
     public File getVideoFile() {
         return videoFile;
+    }
+    
+    public List<FrameProcessor> getFrameProcessors() {
+        return new ArrayList<>(frameProcessors);
     }
 
     public String getErrorMessage() {
@@ -88,7 +100,9 @@ public class CommandLineController {
                 setDisplayId(1);
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
-            } else if (arg.startsWith("-")) {
+            } else if ("-w".equals(arg) || "--black-and-white".equals(arg)) {
+                frameProcessors.add(new FrameBlackAndWhiter());
+            }else if (arg.startsWith("-")) {
                 errorMessage = "Unknown option: " + arg;
             } else {
                 videoFiles.add(arg);
