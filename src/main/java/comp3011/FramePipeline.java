@@ -19,7 +19,9 @@ public class FramePipeline {
     private final List<BlockingQueue<FrameTask>> queues;
     private final List<FrameProcessingStage> stages;
     private final List<Thread> workerThreads;
-
+    private boolean started;
+    private boolean closed;
+    
     public FramePipeline(
             List<FrameProcessor> processors,
             InfoVideo videoInfo) {
@@ -56,6 +58,95 @@ public class FramePipeline {
 
             stages.add(stage);
             workerThreads.add(worker);
+        }
+    }
+    public synchronized void start() {
+        if (closed) {
+            throw new IllegalStateException("The pipeline is closed.");
+        }
+
+        if (started) {
+            return;
+        }
+
+        for (Thread worker : workerThreads) {
+            worker.start();
+        }
+
+        started = true;
+    }
+
+    // A successful offer transfers ownership of the task to the pipeline.
+    public synchronized boolean offer(FrameTask task) {
+        if (!started || closed || getFailure() != null) {
+            return false;
+        }
+
+        return queues.get(0).offer(task);
+    }
+
+    // Return immediately if no completed frame is available.
+    public synchronized FrameTask poll() {
+        if (!started || closed) {
+            return null;
+        }
+
+        return queues.get(queues.size() - 1).poll();
+    }
+
+    public Exception getFailure() {
+        for (FrameProcessingStage stage : stages) {
+            Exception failure = stage.getFailure();
+
+            if (failure != null) {
+                return failure;
+            }
+        }
+
+        return null;
+    }
+    /**
+     * Stops workers and releases frames still owned by the pipeline.
+     * Call this from the playback worker because waiting may take time.
+     */
+    public void shutdown() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+
+            closed = true;
+        }
+
+        // Interrupt every worker before waiting for any worker.
+        for (Thread worker : workerThreads) {
+            worker.interrupt();
+        }
+
+        boolean interrupted = false;
+
+        for (Thread worker : workerThreads) {
+            while (worker.isAlive()) {
+                try {
+                    worker.join();
+                } catch (InterruptedException exception) {
+                    interrupted = true;
+                }
+            }
+        }
+
+        // Workers have stopped, so queued frames are no longer being modified.
+        for (BlockingQueue<FrameTask> queue : queues) {
+            FrameTask task = queue.poll();
+
+            while (task != null) {
+                task.getFrame().close();
+                task = queue.poll();
+            }
+        }
+
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 }
