@@ -10,7 +10,7 @@
  *   Extended the command-line help text with frame processor options.
  *   Added parsing and storage for black-and-white effect options
  *   Added long and short option parsing for all eleven frame processors.
- * 
+ *   Added grouped short option expansion while preserving option order.
  * 
  * 
  * 
@@ -86,10 +86,30 @@ public class CommandLineController {
     public boolean shouldLaunchApplication() {
         return errorMessage == null && videoFile != null;
     }
+    
+ // Expand grouped short options without changing their order.
+    private List<String> expandShortOptions(String[] arguments) {
+        List<String> expandedArguments = new ArrayList<>();
+
+        for (String argument : arguments) {
+            if (argument.startsWith("-")
+                    && !argument.startsWith("--")
+                    && argument.length() > 2) {
+
+                for (int index = 1; index < argument.length(); index++) {
+                    expandedArguments.add("-" + argument.charAt(index));
+                }
+            } else {
+                expandedArguments.add(argument);
+            }
+        }
+
+        return expandedArguments;
+    }
 
     private void parse() {
         List<String> videoFiles = new ArrayList<>();
-        for (String arg : args) {
+        for (String arg : expandShortOptions(args)) {
             if ("-h".equals(arg) || "--help".equals(arg)) {
                 helpRequested = true;
             } else if ("-a".equals(arg) || "--audio".equals(arg)) {
