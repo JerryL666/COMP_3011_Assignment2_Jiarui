@@ -8,7 +8,9 @@
  *
  * Modifications:
  *   Replaced hard-coded effect selection with a supplied processor list.
- *   
+ *   Added independent frame copies and explicit copied-frame cleanup.
+ *   Added playback identifiers for future stale-frame checks.
+ *    
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
@@ -80,6 +82,7 @@ public class VideoPlayerModel {
     private boolean audioOutputEnabled;
     private boolean audioAvailable;
     private boolean frameProcessorsInitialised;
+    private int playbackId;
     private long currentTimestampUs;
     private long videoDurationUs = NO_SEEK_REQUEST;
     private int videoFrameDurationUs;
@@ -275,7 +278,9 @@ public class VideoPlayerModel {
     }
 
     private void resetPlaybackClock(long logicalTimestampUs) {
-        pendingAudio.clear();
+    	// A new playback position starts a new batch of frame tasks.
+    	playbackId++;
+    	pendingAudio.clear();
         preparedFrame = null;
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
@@ -347,9 +352,11 @@ public class VideoPlayerModel {
 
             int frameNumber = grabber.getFrameNumber();
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-            processFrame(frame, info);
 
-            Image image = converter.convert(frame);
+            // The decoder may reuse its buffer, so process an independent copy.
+            FrameTask task = new FrameTask(frame.clone(), info, playbackId);
+            Image image = processVideoFrame(task);
+            
             long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
             long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
             long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
@@ -365,6 +372,17 @@ public class VideoPlayerModel {
 
         return null;
     }
+    
+    private Image processVideoFrame(FrameTask task) throws Exception {
+        try {
+            processFrame(task.getFrame(), task.getInfo());
+            return converter.convert(task.getFrame());
+        } finally {
+            // This method owns the copied frame and must release it.
+            task.getFrame().close();
+        }
+    }
+    
 
     // This is called on a heart beat by the GUI thread. We want to be co-operative here by (a) not blocking, and (b)
     // getting our required work out of the way quickly so that we can return control flow to the JavaFX event loop for
