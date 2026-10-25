@@ -9,7 +9,7 @@
  * Modifications:
  *   Extended the command-line help text with frame processor options.
  *   Added parsing and storage for black-and-white effect options
- * 
+ *   Added long and short option parsing for all eleven frame processors.
  * 
  * 
  * 
@@ -100,10 +100,14 @@ public class CommandLineController {
                 setDisplayId(1);
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
-            } else if ("-w".equals(arg) || "--black-and-white".equals(arg)) {
-                frameProcessors.add(new FrameBlackAndWhiter());
-            }else if (arg.startsWith("-")) {
-                errorMessage = "Unknown option: " + arg;
+            }  else if (arg.startsWith("-")) {
+                FrameProcessor processor = createFrameProcessor(arg);
+
+                if (processor != null) {
+                    frameProcessors.add(processor);
+                } else {
+                    errorMessage = "Unknown option: " + arg;
+                }
             } else {
                 videoFiles.add(arg);
             }
@@ -121,6 +125,57 @@ public class CommandLineController {
             if (!helpRequested) {
                 errorMessage = "No video file specified.";
             }
+        }
+    }
+ // Create a separate processor for each occurrence of an effect option.
+    private FrameProcessor createFrameProcessor(String option) {
+        switch (option) {
+            case "-n":
+            case "--number-frames":
+                return new FrameNumberer();
+
+            case "-s":
+            case "--scratch-frames":
+                return new FrameScratcher();
+
+            case "-f":
+            case "--flicker-frames":
+                return new FrameFlickerer();
+
+            case "-w":
+            case "--black-and-white":
+                return new FrameBlackAndWhiter();
+
+            case "-y":
+            case "--yellow-frames":
+                return new FrameYellower();
+
+            case "-v":
+            case "--vignette-frames":
+                return new FrameVignetter();
+
+            case "-d":
+            case "--dust-frames":
+                return new FrameDuster();
+
+            case "-j":
+            case "--jitter-frames":
+                return new FrameJitterer();
+
+            case "-m":
+            case "--mottle-frames":
+                return new FrameMottler();
+
+            case "-b":
+            case "--bleed-frames":
+                return new FrameBleeder();
+
+            case "-p":
+            case "--pepper-frames":
+                return new FramePepperer();
+
+            default:
+                return null;
         }
     }
 
