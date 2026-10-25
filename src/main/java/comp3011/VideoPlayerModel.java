@@ -12,6 +12,8 @@
  *   Added playback identifiers for future stale-frame checks.
  *   Moved playback operations to a single background worker.
  *   Routed view callbacks through the JavaFX application thread.
+ *   Connected frame processing to the worker pipeline.
+ *   Added pipeline cleanup when playback resources are closed.
  *    
  * Copyright 2026 Simon Ratcliffe
  */
@@ -36,8 +38,9 @@ import javafx.scene.image.Image;
 /**
  * Owns decoding, playback timing, audio scheduling and frame processing.
  *
- * Playback operations run on one background worker. View callbacks are
- * dispatched to the JavaFX application thread.
+ * Playback control and decoding run on one background worker. Effect stages
+ * run on their own threads, with one frame in flight in this intermediate version.
+ * View callbacks are dispatched to the JavaFX application thread.
  */
 public class VideoPlayerModel {
     private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
@@ -54,6 +57,7 @@ public class VideoPlayerModel {
 
     // Decoder access and playback state changes run on this worker.
     private final PlaybackWorker playbackWorker;
+    private FramePipeline framePipeline;
 
     private File videoFile; // Path to the media that comes from the command line
     private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame objects.
@@ -64,7 +68,6 @@ public class VideoPlayerModel {
     private boolean pauseRequested;
     private volatile boolean audioOutputEnabled;
     private boolean audioAvailable;
-    private boolean frameProcessorsInitialised;
     private volatile int playbackId;
     private long currentTimestampUs;
     private long videoDurationUs = NO_SEEK_REQUEST;
@@ -330,8 +333,8 @@ public class VideoPlayerModel {
                 continue;
             }
 
-            if (!frameProcessorsInitialised) {
-                initialiseFrameProcessors(new InfoVideo(
+            if (framePipeline == null) {
+                initialiseFramePipeline(new InfoVideo(
                         mediaName(videoFile),
                         totalVideoFrames,
                         frame.imageWidth,
@@ -343,7 +346,6 @@ public class VideoPlayerModel {
                         intFrameRate,
                         videoFrameDurationUs,
                         grabber.getPixelFormat()));
-                frameProcessorsInitialised = true;
             }
 
             if (firstTimestampUs == NO_SEEK_REQUEST) {
@@ -378,15 +380,49 @@ public class VideoPlayerModel {
     }
     
     private Image processVideoFrame(FrameTask task) throws Exception {
+        boolean submitted = false;
+
         try {
-            processFrame(task.getFrame(), task.getInfo());
-            return converter.convert(task.getFrame());
+            submitted = framePipeline.offer(task);
+
+            if (!submitted) {
+                Exception failure = framePipeline.getFailure();
+
+                if (failure != null) {
+                    throw failure;
+                }
+
+                throw new IllegalStateException("The pipeline did not accept the frame.");
+            }
+
+            // Temporary one-frame-at-a-time integration.
+            while (true) {
+                Exception failure = framePipeline.getFailure();
+
+                if (failure != null) {
+                    throw failure;
+                }
+
+                FrameTask completedTask = framePipeline.poll();
+
+                if (completedTask != null) {
+                    try {
+                        return converter.convert(completedTask.getFrame());
+                    } finally {
+                        // The model owns a task after removing it from the pipeline.
+                        completedTask.getFrame().close();
+                    }
+                }
+
+                Thread.sleep(1);
+            }
         } finally {
-            // This method owns the copied frame and must release it.
-            task.getFrame().close();
+            // A rejected task still belongs to the caller.
+            if (!submitted) {
+                task.getFrame().close();
+            }
         }
     }
-    
 
     // Called regularly on the playback worker, not the JavaFX thread.
     private void pumpPlayback(long now) {
@@ -503,7 +539,12 @@ public class VideoPlayerModel {
         playbackStartNs = 0;
         pauseStartedNs = 0;
         audioAvailable = false;
-        frameProcessorsInitialised = false;
+
+        // Stop workers before reusing processors or releasing playback resources.
+        if (framePipeline != null) {
+            framePipeline.shutdown();
+            framePipeline = null;
+        }
 
         if (audioPlayer != null) {
             audioPlayer.close();
@@ -562,16 +603,9 @@ public class VideoPlayerModel {
         return Math.max(0, durationUs - frameDurationUs);
     }
 
-    private void processFrame(Frame frame, InfoFrame info) throws Exception {
-        for (FrameProcessor processor : frameProcessors) {
-            processor.process(frame, info);
-        }
-    }
-
-    private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
-        for (FrameProcessor processor : frameProcessors) {
-            processor.initialise(videoInfo);
-        }
+    private void initialiseFramePipeline(InfoVideo videoInfo) {
+        framePipeline = new FramePipeline(frameProcessors, videoInfo);
+        framePipeline.start();
     }
 
     private Frame grabFrame() throws Exception {
