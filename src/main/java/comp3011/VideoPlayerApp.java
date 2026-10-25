@@ -4,8 +4,10 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
- *
+ *   2. Jiarui Li(a19044422), developed with assistance from OpenAI Codex.
+* Modifications:
+ *   Passed command-line frame processors to the controller.
+ *   
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
@@ -45,6 +47,7 @@ public class VideoPlayerApp extends Application {
 
         controller = new VideoPlayerController(
                 commandLineController.isAudioRequested(),
+                commandLineController.getFrameProcessors(),
                 this::setVideoSize);
 
         Scene scene = new Scene(controller.getView().getRoot());

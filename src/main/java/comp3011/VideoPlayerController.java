@@ -4,12 +4,15 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Jiarui L(a1904422), developed with assistance from OpenAI Codex.
+ * 
+ * Modifications:
+ *   Passed selected frame processors to the model.
  *
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
-
+import java.util.List;
 import java.io.File;
 import java.util.function.BiConsumer;
 
@@ -33,11 +36,15 @@ public class VideoPlayerController {
 
     public VideoPlayerController(
             boolean audioEnabled,
+            List<FrameProcessor> frameProcessors,
             BiConsumer<Integer, Integer> videoSizeChangedHandler) {
         this.view = new VideoPlayerView();
         this.videoSizeChangedHandler = videoSizeChangedHandler;
+
+        // Pass selected effects to the model, which processes video frames.
         model = new VideoPlayerModel(
                 audioEnabled,
+                frameProcessors,
                 this::onVideoSizeChanged,
                 this::onFrameReady,
                 this::onStatusChanged,
@@ -52,6 +59,7 @@ public class VideoPlayerController {
         view.getAudioButton().setOnAction(_ -> toggleAudioOutput());
         view.showAudioEnabled(model.isAudioOutputEnabled());
     }
+
 
     public void installKeyboardShortcuts(Scene scene) {
         scene.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
