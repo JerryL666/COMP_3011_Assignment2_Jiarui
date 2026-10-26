@@ -14,6 +14,8 @@
  *   Routed view callbacks through the JavaFX application thread.
  *   Connected frame processing to the worker pipeline.
  *   Added pipeline cleanup when playback resources are closed.
+ *   Added bounded multi-frame pipeline processing.
+ *   Discarded obsolete results after seeking and drained work before EOF cleanup.
  *    
  * Copyright 2026 Simon Ratcliffe
  */
@@ -39,13 +41,14 @@ import javafx.scene.image.Image;
  * Owns decoding, playback timing, audio scheduling and frame processing.
  *
  * Playback control and decoding run on one background worker. Effect stages
- * run on their own threads, with one frame in flight in this intermediate version.
+ * run on their own threads, with a bounded number of frames in flight.
  * View callbacks are dispatched to the JavaFX application thread.
  */
 public class VideoPlayerModel {
     private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
+    private static final int MAX_FRAMES_IN_PIPELINE = 8;
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
@@ -58,6 +61,10 @@ public class VideoPlayerModel {
     // Decoder access and playback state changes run on this worker.
     private final PlaybackWorker playbackWorker;
     private FramePipeline framePipeline;
+    private FrameTask pendingFrameTask;
+    private int framesInPipeline;
+    private boolean endOfVideo;
+    private boolean previewRequested;
 
     private File videoFile; // Path to the media that comes from the command line
     private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame objects.
@@ -161,6 +168,7 @@ public class VideoPlayerModel {
         }
 
         pauseRequested = !pauseRequested;
+        previewRequested = false;
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         if (pauseRequested) {
@@ -285,10 +293,20 @@ public class VideoPlayerModel {
     }
 
     private void resetPlaybackClock(long logicalTimestampUs) {
-        // A new playback position starts a new batch of frame tasks.
         playbackId++;
+
+        // An unsubmitted frame still belongs to the model.
+        if (pendingFrameTask != null) {
+            pendingFrameTask.getFrame().close();
+            pendingFrameTask = null;
+        }
+
         pendingAudio.clear();
         preparedFrame = null;
+        endOfVideo = false;
+        previewRequested = pauseRequested;
+
+        // Old tasks remain counted until they return and are released.
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
         firstTimestampUs = NO_SEEK_REQUEST;
@@ -304,23 +322,56 @@ public class VideoPlayerModel {
         pauseStartedNs = 0;
     }
 
-    private void prepareNextFrame() {
-        if (!playbackOpen || preparedFrame != null) {
+    private void prepareNextFrame() throws Exception {
+        if (!playbackOpen
+                || preparedFrame != null
+                || framePipeline == null
+                || (pauseRequested && !previewRequested)) {
             return;
         }
 
-        try {
-            preparedFrame = readNextVideoFrame();
-        } catch (Exception e) {
-            handlePlaybackError(e);
+        FrameTask task = framePipeline.poll();
+
+        while (task != null) {
+            framesInPipeline--;
+
+            try {
+                // Old tasks may finish after the user has sought elsewhere.
+                if (task.getPlaybackId() == playbackId) {
+                    InfoFrame info = task.getInfo();
+                    Image image = converter.convert(task.getFrame());
+
+                    long relativeTimestampUs =
+                            Math.max(0, info.timestampUs() - firstTimestampUs);
+                    long logicalTimestampUs =
+                            logicalPlaybackBaseUs + relativeTimestampUs;
+                    long targetTimeNs =
+                            playbackStartNs + relativeTimestampUs * 1_000L;
+
+                    preparedFrame = new PreparedFrame(
+                            image,
+                            info.frameNumber(),
+                            info.timestampUs(),
+                            logicalTimestampUs,
+                            targetTimeNs,
+                            System.nanoTime());
+
+                    return;
+                }
+            } finally {
+                // Both accepted results and obsolete results must be released.
+                task.getFrame().close();
+            }
+
+            task = framePipeline.poll();
         }
     }
 
-    private PreparedFrame readNextVideoFrame() throws Exception {
+    private FrameTask readNextVideoTask() throws Exception {
         while (playbackOpen) {
             Frame frame = grabFrame();
             if (frame == null) {
-                finishPlayback();
+                endOfVideo = true;
                 return null;
             }
 
@@ -359,85 +410,80 @@ public class VideoPlayerModel {
             int frameNumber = grabber.getFrameNumber();
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
 
-            // The decoder may reuse its buffer, so process an independent copy.
-            FrameTask task = new FrameTask(frame.clone(), info, playbackId);
-            Image image = processVideoFrame(task);
-            
-            long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-            long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-            long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
-            return new PreparedFrame(
-                    image,
-                    frameNumber,
-                    timestampUs,
-                    logicalTimestampUs,
-                    targetTimeNs,
-                    System.nanoTime());
+            // Keep the task independent of the decoder's reusable buffer.
+            return new FrameTask(frame.clone(), info, playbackId);
         }
 
         return null;
     }
     
-    private Image processVideoFrame(FrameTask task) throws Exception {
-        boolean submitted = false;
+    private void feedPipeline() throws Exception {
+        if (endOfVideo || framesInPipeline >= MAX_FRAMES_IN_PIPELINE) {
+            return;
+        }
 
-        try {
-            submitted = framePipeline.offer(task);
+        // While paused, decode only the frame needed for a seek preview.
+        if (pauseRequested
+                && (!previewRequested
+                    || framesInPipeline > 0
+                    || preparedFrame != null)) {
+            return;
+        }
 
-            if (!submitted) {
-                Exception failure = framePipeline.getFailure();
+        if (pendingFrameTask == null) {
+            pendingFrameTask = readNextVideoTask();
+        }
 
-                if (failure != null) {
-                    throw failure;
-                }
-
-                throw new IllegalStateException("The pipeline did not accept the frame.");
-            }
-
-            // Temporary one-frame-at-a-time integration.
-            while (true) {
-                Exception failure = framePipeline.getFailure();
-
-                if (failure != null) {
-                    throw failure;
-                }
-
-                FrameTask completedTask = framePipeline.poll();
-
-                if (completedTask != null) {
-                    try {
-                        return converter.convert(completedTask.getFrame());
-                    } finally {
-                        // The model owns a task after removing it from the pipeline.
-                        completedTask.getFrame().close();
-                    }
-                }
-
-                Thread.sleep(1);
-            }
-        } finally {
-            // A rejected task still belongs to the caller.
-            if (!submitted) {
-                task.getFrame().close();
-            }
+        if (pendingFrameTask != null
+                && framePipeline.offer(pendingFrameTask)) {
+            framesInPipeline++;
+            pendingFrameTask = null;
         }
     }
 
-    // Called regularly on the playback worker, not the JavaFX thread.
+    // Playback updates never wait for a frame to finish processing.
     private void pumpPlayback(long now) {
         if (!playbackOpen) {
             return;
         }
 
-        writeDueAudio(now);
+        try {
+            if (framePipeline != null) {
+                Exception failure = framePipeline.getFailure();
 
-        if (preparedFrame != null && preparedFrame.targetTimeNs() <= now) {
-            displayPreparedFrame(now);
-        }
+                if (failure != null) {
+                    throw failure;
+                }
+            }
 
-        if (!pauseRequested && preparedFrame == null) {
+            writeDueAudio(now);
             prepareNextFrame();
+
+            if (preparedFrame != null) {
+                boolean frameDue =
+                        !pauseRequested && preparedFrame.targetTimeNs() <= now;
+
+                if (previewRequested || frameDue) {
+                    displayPreparedFrame(now);
+                    previewRequested = false;
+                }
+            }
+
+            if (!pauseRequested || previewRequested) {
+                feedPipeline();
+            }
+
+            // Reading EOF does not mean that all queued work has finished.
+            if (!pauseRequested
+                    && endOfVideo
+                    && pendingFrameTask == null
+                    && framesInPipeline == 0
+                    && preparedFrame == null
+                    && pendingAudio.isEmpty()) {
+                finishPlayback();
+            }
+        } catch (Exception exception) {
+            handlePlaybackError(exception);
         }
     }
 
@@ -511,7 +557,8 @@ public class VideoPlayerModel {
                 ? videoDurationUs
                 : currentTimestampUs;
 
-        closePlaybackResources();
+        // Preserve the final image callback when playback ends naturally.
+        closePlaybackResources(false);
         pauseRequested = true;
         currentTimestampUs = endTimestampUs;
         relativeSeekBaseUs = endTimestampUs;
@@ -528,10 +575,16 @@ public class VideoPlayerModel {
     }
 
     private void closePlaybackResources() {
+        closePlaybackResources(true);
+    }
+
+    private void closePlaybackResources(boolean invalidateImages) {
         playbackWorker.stopUpdates();
 
-        // Invalidate images already queued for display before resetting playback.
-        playbackId++;
+        // Invalidate old images for explicit stops, but preserve the final EOF image.
+        if (invalidateImages) {
+            playbackId++;
+        }
         playbackOpen = false;
         preparedFrame = null;
         pendingAudio.clear();
@@ -545,6 +598,15 @@ public class VideoPlayerModel {
             framePipeline.shutdown();
             framePipeline = null;
         }
+
+        if (pendingFrameTask != null) {
+            pendingFrameTask.getFrame().close();
+            pendingFrameTask = null;
+        }
+
+        framesInPipeline = 0;
+        endOfVideo = false;
+        previewRequested = false;
 
         if (audioPlayer != null) {
             audioPlayer.close();
