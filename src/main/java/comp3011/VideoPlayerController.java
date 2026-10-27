@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. Jiarui L(a1904422), developed with assistance from OpenAI Codex.
+ *   2. Jiarui L(a1904422), developed with assistance from GPT6.1.
  * 
  * Modifications:
  *   Passed selected frame processors to the model.

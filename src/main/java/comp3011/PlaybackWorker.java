@@ -1,6 +1,6 @@
 /*
  * Author: Jiarui Li
- * Developed with assistance from OpenAI Codex.
+ * Developed with assistance from GPT6.1.
  */
 package comp3011;
 
